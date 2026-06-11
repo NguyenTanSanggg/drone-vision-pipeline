@@ -1,0 +1,149 @@
+#pragma once
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
+
+#include <opencv2/core.hpp>
+#include <opencv2/opencv.hpp>
+#include <cv_bridge/cv_bridge.hpp>
+
+class CubeDetectorNode : public rclcpp::Node
+{
+public:
+	CubeDetectorNode();
+
+private:
+	struct VictimModel
+	{
+		cv::Rect boxBbox;
+		cv::Point2f boxCenter;
+		cv::Point2f circleCenter;
+		float circleRadius{0.0f};
+		bool hasCircle{false};
+		float confidence{0.0f};
+		bool valid{false};
+	};
+
+	void loadParameters();
+	void image_callback(const sensor_msgs::msg::Image::SharedPtr msg);
+	void camera_info_callback(const sensor_msgs::msg::CameraInfo::SharedPtr msg);
+	
+	VictimModel detectVictimModel(const cv::Mat &frame);
+	bool isLockedCandidateValid(const cv::Rect &bbox, const cv::Point2f &center) const;
+	bool detectBoxRegion(const cv::Mat &hsv, cv::Rect &boxBbox, cv::Point2f &boxCenter);
+	bool detectCircularHandle(const cv::Mat &frame, const cv::Rect &boxRegion, cv::Point2f &circleCenter, float &radius);
+	bool validateVictimGeometry(const VictimModel &model);
+
+	void estimate_victim_pose(
+		const VictimModel &target,
+		int image_width,
+		int image_height,
+		double &x,
+		double &y,
+		double &z) const;
+
+	void updateKalmanFilter(double measured_x, double measured_y, double measured_z);
+
+	void annotate_image(
+		cv_bridge::CvImagePtr image,
+		const VictimModel &target,
+		double filtered_x,
+		double filtered_y,
+		double filtered_z) const;
+
+	void reset_lock_state();
+	
+private:
+	// Topic params
+	std::string _image_topic{"/camera/image"};
+	std::string _camera_info_topic{"/camera/camera_info"};
+	std::string _debug_image_topic{"/cube_detector/debug_image"};
+
+	// Last seen pose hold
+	bool _has_last_seen_pose{false};
+	double _last_seen_x{0.0};
+	double _last_seen_y{0.0};
+	double _last_seen_z{0.0};
+
+	bool _last_seen_timer_started{false};
+	rclcpp::Time _last_seen_lost_start_time{0, 0, RCL_ROS_TIME};
+
+	double _param_last_seen_hold_timeout_s{0.5};
+
+	// Box detection params
+	int _param_h_min{5};
+	int _param_s_min{80};
+	int _param_v_min{50};
+	int _param_h_max{30};
+	int _param_s_max{255};
+	int _param_v_max{255};
+
+	int _param_min_box_area{500};
+	int _param_max_box_area{200000};
+
+	// Circle detection params
+	int _param_circle_h_min{0};
+	int _param_circle_s_min{0};
+	int _param_circle_v_min{0};
+	int _param_circle_h_max{180};
+	int _param_circle_s_max{50};
+	int _param_circle_v_max{200};
+
+	float _param_circle_min_radius{15.0f};
+	float _param_circle_max_radius{80.0f};
+	float _param_circle_position_tolerance{0.15f};
+
+	// Real object size
+	double _param_box_width_m{0.45};
+
+	// Kalman params
+	double _param_kalman_q{0.01};
+	double _param_kalman_r{0.5};
+
+	// Lock / memory params
+	double _param_lock_max_dist_px{120.0};
+	double _param_lock_min_size_ratio{0.5};
+
+	// Lock state
+	bool _locked{false};
+	cv::Point2f _lock_center{0.0f, 0.0f};
+	float _lock_visible_size{0.0f};
+
+	int _lock_missed{0};
+	int _param_max_lock_missed{30};
+
+	// Filtered pose
+	double _filtered_x{0.0};
+	double _filtered_y{0.0};
+	double _filtered_z{0.0};
+	double _cov_x{1.0};
+	double _cov_y{1.0};
+	double _cov_z{1.0};
+
+	// Last valid pose
+	double _last_x{0.0};
+	double _last_y{0.0};
+	double _last_z{0.0};
+	bool _has_last_pose{false};
+
+	// ROS interfaces
+	rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr _image_sub;
+	rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr _camera_info_sub;
+
+	rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _image_pub;
+	rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr _target_pose_pub;
+	rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr _target_valid_pub;
+
+	// Camera model
+	cv::Mat _camera_matrix;
+	cv::Mat _dist_coeffs;
+	bool _has_camera_info{false};
+};

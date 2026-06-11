@@ -1,0 +1,16 @@
+build/
+*.o
+*.so
+*.a
+*.out
+*.log
+*.csv
+*.mp4
+*.avi
+*.mkv
+*.bag
+*.db3
+.DS_Store
+.vscode/
+.idea/
+__pycache__/

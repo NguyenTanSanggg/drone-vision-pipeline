@@ -1,0 +1,48 @@
+hsv:
+  red:
+    min: [170, 70, 90]
+    max: [16, 255, 255]
+  yellow:
+    min: [14, 20, 120]
+    max: [38, 220, 255]
+  blue:
+    min: [85, 45, 80]
+    max: [115, 255, 255]
+
+image_detector:
+  min_area_px: 250
+  max_area_px: 250000
+  min_radius_px: 8.0
+  max_radius_px: 260.0
+  min_circularity: 0.55
+  min_fill_ratio: 0.45
+  morph_kernel_size: 5
+
+  red_light_rgb_enable: true
+  red_light_s_max: 145
+  red_light_v_min: 145
+  red_rgb_min: 120
+  red_rgb_margin: 12
+
+  yellow_light_rgb_enable: true
+  yellow_light_s_max: 150
+  yellow_light_v_min: 145
+  yellow_rgb_min: 120
+  yellow_rgb_margin: 10
+
+  blue_light_rgb_enable: true
+  blue_light_s_max: 165
+  blue_light_v_min: 120
+  blue_rgb_min: 100
+  blue_rgb_margin: 10
+
+vision_landing:
+  landing_pad_size_m: 1.50
+  dark_threshold: 130
+  white_threshold: 185
+  morph_kernel_size: 5
+  image_timeout_sec: 0.50
+  descend_gate_m: 0.25
+  descend_stable_sec: 0.35
+  vz_mps: 0.40
+  debug_enable: true

@@ -1,0 +1,721 @@
+#include "CubeDetector.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
+#include <vector>
+
+#include <sensor_msgs/image_encodings.hpp>
+#include <cv_bridge/cv_bridge.hpp>
+
+CubeDetectorNode::CubeDetectorNode()
+	: Node("cube_detector_node")
+{
+	loadParameters();
+
+	auto qos = rclcpp::QoS(1).best_effort();
+
+	_image_sub = create_subscription<sensor_msgs::msg::Image>(
+		"/camera/image",
+		qos,
+		std::bind(&CubeDetectorNode::image_callback, this, std::placeholders::_1));
+
+	_camera_info_sub = create_subscription<sensor_msgs::msg::CameraInfo>(
+		"/camera/camera_info",
+		qos,
+		std::bind(&CubeDetectorNode::camera_info_callback, this, std::placeholders::_1));
+
+	_image_pub = create_publisher<sensor_msgs::msg::Image>("/cube_detector/debug_image", qos);
+	_target_pose_pub = create_publisher<geometry_msgs::msg::PoseStamped>("/target_pose", qos);
+	_target_valid_pub = create_publisher<std_msgs::msg::Bool>("/target_valid", qos);
+
+	RCLCPP_INFO(get_logger(), "===== CubeDetectorNode started =====");
+	RCLCPP_INFO(get_logger(), "Subscribing to camera topics");
+	RCLCPP_INFO(get_logger(), "image_topic           : /camera/image");
+	RCLCPP_INFO(get_logger(), "camera_info_topic     : /camera/camera_info");
+	RCLCPP_INFO(get_logger(), "debug_image_topic     : /cube_detector/debug_image");
+	RCLCPP_INFO(get_logger(), "box_width_m           : %.3f", _param_box_width_m);
+	RCLCPP_INFO(get_logger(), "min_box_area          : %d", _param_min_box_area);
+	RCLCPP_INFO(get_logger(), "circle_min_radius     : %.1f", _param_circle_min_radius);
+	RCLCPP_INFO(get_logger(), "circle_max_radius     : %.1f", _param_circle_max_radius);
+	RCLCPP_INFO(get_logger(), "max_lock_missed       : %d", _param_max_lock_missed);
+}
+
+void CubeDetectorNode::loadParameters()
+{
+	declare_parameter<int>("h_min", 5);
+	declare_parameter<int>("s_min", 80);
+	declare_parameter<int>("v_min", 50);
+	declare_parameter<int>("h_max", 30);
+	declare_parameter<int>("s_max", 255);
+	declare_parameter<int>("v_max", 255);
+
+	declare_parameter<int>("min_box_area", 500);
+	declare_parameter<int>("max_box_area", 200000);
+
+	declare_parameter<int>("circle_h_min", 0);
+	declare_parameter<int>("circle_s_min", 0);
+	declare_parameter<int>("circle_v_min", 0);
+	declare_parameter<int>("circle_h_max", 180);
+	declare_parameter<int>("circle_s_max", 50);
+	declare_parameter<int>("circle_v_max", 200);
+
+	declare_parameter<double>("circle_min_radius", 15.0);
+	declare_parameter<double>("circle_max_radius", 80.0);
+	declare_parameter<double>("circle_position_tolerance", 0.15);
+
+	declare_parameter<double>("box_width_m", 0.45);
+	declare_parameter<int>("max_lock_missed", 30);
+
+	declare_parameter<double>("kalman_q", 0.01);
+	declare_parameter<double>("kalman_r", 0.5);
+
+	declare_parameter<double>("last_seen_hold_timeout_s", 0.5);
+	declare_parameter<double>("lock_max_dist_px", 120.0);
+	declare_parameter<double>("lock_min_size_ratio", 0.5);
+
+	get_parameter("lock_max_dist_px", _param_lock_max_dist_px);
+	get_parameter("lock_min_size_ratio", _param_lock_min_size_ratio);
+	get_parameter("last_seen_hold_timeout_s", _param_last_seen_hold_timeout_s);
+
+	get_parameter("h_min", _param_h_min);
+	get_parameter("s_min", _param_s_min);
+	get_parameter("v_min", _param_v_min);
+	get_parameter("h_max", _param_h_max);
+	get_parameter("s_max", _param_s_max);
+	get_parameter("v_max", _param_v_max);
+
+	get_parameter("min_box_area", _param_min_box_area);
+	get_parameter("max_box_area", _param_max_box_area);
+
+	get_parameter("circle_h_min", _param_circle_h_min);
+	get_parameter("circle_s_min", _param_circle_s_min);
+	get_parameter("circle_v_min", _param_circle_v_min);
+	get_parameter("circle_h_max", _param_circle_h_max);
+	get_parameter("circle_s_max", _param_circle_s_max);
+	get_parameter("circle_v_max", _param_circle_v_max);
+
+	get_parameter("circle_min_radius", _param_circle_min_radius);
+	get_parameter("circle_max_radius", _param_circle_max_radius);
+	get_parameter("circle_position_tolerance", _param_circle_position_tolerance);
+
+	get_parameter("box_width_m", _param_box_width_m);
+	get_parameter("max_lock_missed", _param_max_lock_missed);
+
+	get_parameter("kalman_q", _param_kalman_q);
+	get_parameter("kalman_r", _param_kalman_r);
+}
+
+void CubeDetectorNode::camera_info_callback(const sensor_msgs::msg::CameraInfo::SharedPtr msg)
+{
+	if (_has_camera_info) return;  // Only set once
+
+	_camera_matrix = cv::Mat(3, 3, CV_64F, const_cast<double *>(msg->k.data())).clone();
+
+	if (!msg->d.empty()) {
+		_dist_coeffs = cv::Mat(
+			static_cast<int>(msg->d.size()), 1, CV_64F, const_cast<double *>(msg->d.data())).clone();
+	} else {
+		_dist_coeffs = cv::Mat::zeros(5, 1, CV_64F);
+	}
+
+	_has_camera_info = true;
+	RCLCPP_INFO(get_logger(), "Camera intrinsics received");
+	RCLCPP_INFO(get_logger(), "fx=%.1f, fy=%.1f, cx=%.1f, cy=%.1f",
+		msg->k[0], msg->k[4], msg->k[2], msg->k[5]);
+}
+
+void CubeDetectorNode::image_callback(const sensor_msgs::msg::Image::SharedPtr msg)
+{
+	if (!_has_camera_info) {
+		RCLCPP_WARN_ONCE(get_logger(), "Waiting for camera info...");
+		return;
+	}
+
+	try {
+		auto cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
+
+		VictimModel victim = detectVictimModel(cv_ptr->image);
+
+		std_msgs::msg::Bool valid_msg;
+		valid_msg.data = false;
+
+		const rclcpp::Time now_ts =
+			(msg->header.stamp.sec == 0 && msg->header.stamp.nanosec == 0)
+				? now()
+				: rclcpp::Time(msg->header.stamp);
+
+		if (victim.valid) {
+			_lock_center = victim.boxCenter;
+			_lock_visible_size = static_cast<float>(std::max(victim.boxBbox.width, victim.boxBbox.height));
+			_lock_missed = 0;
+			_locked = true;
+			valid_msg.data = true;
+
+			double raw_x = 0.0;
+			double raw_y = 0.0;
+			double raw_z = 0.0;
+			estimate_victim_pose(victim, cv_ptr->image.cols, cv_ptr->image.rows, raw_x, raw_y, raw_z);
+
+			updateKalmanFilter(raw_x, raw_y, raw_z);
+
+			_last_x = _filtered_x;
+			_last_y = _filtered_y;
+			_last_z = _filtered_z;
+			_has_last_pose = true;
+
+			_last_seen_x = _filtered_x;
+			_last_seen_y = _filtered_y;
+			_last_seen_z = _filtered_z;
+			_has_last_seen_pose = true;
+			_last_seen_timer_started = false;
+			_last_seen_lost_start_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
+
+			geometry_msgs::msg::PoseStamped pose_msg;
+			pose_msg.header.stamp = msg->header.stamp;
+			pose_msg.header.frame_id = "camera_frame";
+			pose_msg.pose.position.x = _filtered_x;
+			pose_msg.pose.position.y = _filtered_y;
+			pose_msg.pose.position.z = _filtered_z;
+			pose_msg.pose.orientation.w = 1.0;
+			_target_pose_pub->publish(pose_msg);
+
+			RCLCPP_INFO_THROTTLE(
+				get_logger(),
+				*get_clock(),
+				500,
+				"[BOX VALID] box=(x=%d y=%d w=%d h=%d) raw=(%.3f, %.3f, %.3f) filtered=(%.3f, %.3f, %.3f) [m]",
+				victim.boxBbox.x,
+				victim.boxBbox.y,
+				victim.boxBbox.width,
+				victim.boxBbox.height,
+				raw_x,
+				raw_y,
+				raw_z,
+				_filtered_x,
+				_filtered_y,
+				_filtered_z);
+		}
+		else {
+			_lock_missed++;
+
+			if (!_last_seen_timer_started) {
+				_last_seen_timer_started = true;
+				_last_seen_lost_start_time = now_ts;
+			}
+
+			const double lost_time_s = (now_ts - _last_seen_lost_start_time).seconds();
+			const bool can_hold =
+				_has_last_seen_pose &&
+				(lost_time_s <= _param_last_seen_hold_timeout_s);
+
+			if (can_hold) {
+				geometry_msgs::msg::PoseStamped pose_msg;
+				pose_msg.header.stamp = msg->header.stamp;
+				pose_msg.header.frame_id = "camera_frame";
+				pose_msg.pose.position.x = _last_seen_x;
+				pose_msg.pose.position.y = _last_seen_y;
+				pose_msg.pose.position.z = _last_seen_z;
+				pose_msg.pose.orientation.w = 1.0;
+				_target_pose_pub->publish(pose_msg);
+
+				valid_msg.data = true;
+
+				_last_x = _last_seen_x;
+				_last_y = _last_seen_y;
+				_last_z = _last_seen_z;
+				_has_last_pose = true;
+
+				RCLCPP_INFO_THROTTLE(
+					get_logger(),
+					*get_clock(),
+					500,
+					"[LAST_SEEN HOLD] lost_time=%.2f s pose=(%.3f, %.3f, %.3f) [m]",
+					lost_time_s,
+					_last_seen_x,
+					_last_seen_y,
+					_last_seen_z);
+			} else {
+				if (_lock_missed > _param_max_lock_missed) {
+					reset_lock_state();
+				}
+
+				valid_msg.data = false;
+
+				RCLCPP_INFO_THROTTLE(
+					get_logger(),
+					*get_clock(),
+					1000,
+					"[SEARCHING BOX] box_area=%d box=(x=%d y=%d w=%d h=%d) missed=%d locked=%d",
+					victim.boxBbox.area(),
+					victim.boxBbox.x,
+					victim.boxBbox.y,
+					victim.boxBbox.width,
+					victim.boxBbox.height,
+					_lock_missed,
+					static_cast<int>(_locked));
+			}
+		}
+
+		_target_valid_pub->publish(valid_msg);
+
+		if (_has_last_pose) {
+			annotate_image(cv_ptr, victim, _last_x, _last_y, _last_z);
+		} else {
+			annotate_image(cv_ptr, victim, 0.0, 0.0, 0.0);
+		}
+
+		_image_pub->publish(*cv_ptr->toImageMsg());
+
+	} catch (const cv_bridge::Exception &e) {
+		RCLCPP_ERROR(get_logger(), "cv_bridge exception: %s", e.what());
+	}
+}
+
+CubeDetectorNode::VictimModel CubeDetectorNode::detectVictimModel(const cv::Mat &frame)
+{
+	VictimModel result;
+	result.valid = false;
+	result.hasCircle = false;
+	result.confidence = 0.0f;
+	result.circleRadius = 0.0f;
+
+	// Convert to HSV
+	cv::Mat hsv;
+	cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
+
+	// Chỉ cần detect được box là đủ valid
+	if (!detectBoxRegion(hsv, result.boxBbox, result.boxCenter)) {
+		return result;
+	}
+
+	result.valid = true;
+	result.confidence = 0.85f;
+
+	return result;
+}
+
+bool CubeDetectorNode::detectBoxRegion(const cv::Mat &hsv, cv::Rect &boxBbox, cv::Point2f &boxCenter)
+{
+	cv::Mat mask;
+	cv::inRange(
+		hsv,
+		cv::Scalar(_param_h_min, _param_s_min, _param_v_min),
+		cv::Scalar(_param_h_max, _param_s_max, _param_v_max),
+		mask);
+
+	cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+	cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
+	cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+
+	std::vector<std::vector<cv::Point>> contours;
+	cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+	bool found = false;
+	double bestScore = -1e18;
+
+	for (const auto &contour : contours) {
+		const double area = cv::contourArea(contour);
+		if (area < _param_min_box_area || area > _param_max_box_area) {
+			continue;
+		}
+
+		const double perimeter = cv::arcLength(contour, true);
+		if (perimeter < 1e-6) {
+			continue;
+		}
+
+		const cv::Rect bbox = cv::boundingRect(contour);
+		if (bbox.width <= 0 || bbox.height <= 0) {
+			continue;
+		}
+
+		const float cx = bbox.x + bbox.width * 0.5f;
+		const float cy = bbox.y + bbox.height * 0.5f;
+		const cv::Point2f center(cx, cy);
+
+		const double aspect = static_cast<double>(bbox.width) / static_cast<double>(bbox.height);
+		const double bbox_area = static_cast<double>(bbox.width * bbox.height);
+		const double fill_ratio = area / std::max(1.0, bbox_area);
+		const double circularity = 4.0 * M_PI * area / (perimeter * perimeter);
+
+		// ===== Loại contour quá tròn =====
+		if (circularity > 0.82) {
+			continue;
+		}
+
+		// ===== Ràng buộc hình dạng gần box =====
+		if (aspect < 0.60 || aspect > 2.20) {
+			continue;
+		}
+
+		if (fill_ratio < 0.45) {
+			continue;
+		}
+
+		double score = 0.0;
+
+		if (_locked) {
+			if (!isLockedCandidateValid(bbox, center)) {
+				continue;
+			}
+
+			const double dx = static_cast<double>(center.x - _lock_center.x);
+			const double dy = static_cast<double>(center.y - _lock_center.y);
+			const double dist = std::sqrt(dx * dx + dy * dy);
+
+			const double visible_size = static_cast<double>(std::max(bbox.width, bbox.height));
+			const double size_ratio =
+				visible_size / std::max(1.0f, _lock_visible_size);
+
+			score =
+				-3.0 * dist
+				-120.0 * std::abs(1.0 - size_ratio)
+				+ 0.02 * area;
+		}
+		else {
+			// Khi chưa lock: ưu tiên object đậm chất box và đủ lớn
+			score =
+				0.03 * area
+				+ 30.0 * fill_ratio
+				- 40.0 * circularity;
+		}
+
+		if (!found || score > bestScore) {
+			bestScore = score;
+			boxBbox = bbox;
+			boxCenter = center;
+			found = true;
+		}
+	}
+
+	return found;
+}
+
+bool CubeDetectorNode::isLockedCandidateValid(const cv::Rect &bbox, const cv::Point2f &center) const
+{
+	const double dx = static_cast<double>(center.x - _lock_center.x);
+	const double dy = static_cast<double>(center.y - _lock_center.y);
+	const double dist = std::sqrt(dx * dx + dy * dy);
+
+	if (dist > _param_lock_max_dist_px) {
+		return false;
+	}
+
+	const float visible_size = static_cast<float>(std::max(bbox.width, bbox.height));
+	if (_lock_visible_size > 1e-6f) {
+		if (visible_size < _lock_visible_size * _param_lock_min_size_ratio) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+// bool CubeDetectorNode::detectBoxRegion(const cv::Mat &hsv, cv::Rect &boxBbox, cv::Point2f &boxCenter)
+// {
+// 	// Create color mask for victim cube (orange color)
+// 	cv::Mat mask;
+// 	cv::inRange(hsv,
+// 		cv::Scalar(_param_h_min, _param_s_min, _param_v_min),
+// 		cv::Scalar(_param_h_max, _param_s_max, _param_v_max),
+// 		mask);
+
+// 	// Morphology to clean up
+// 	cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+// 	cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
+// 	cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+
+// 	// Find contours
+// 	std::vector<std::vector<cv::Point>> contours;
+// 	cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+// 	// Find largest contour
+// 	double maxArea = 0;
+// 	int bestIdx = -1;
+// 	for (size_t i = 0; i < contours.size(); i++) {
+// 		double area = cv::contourArea(contours[i]);
+// 		if (area > maxArea && area >= _param_min_box_area && area <= _param_max_box_area) {
+// 			maxArea = area;
+// 			bestIdx = i;
+// 		}
+// 	}
+
+// 	if (bestIdx < 0) {
+// 		return false;
+// 	}
+
+// 	// Get bounding box
+// 	boxBbox = cv::boundingRect(contours[bestIdx]);
+// 	boxCenter.x = boxBbox.x + boxBbox.width * 0.5f;
+// 	boxCenter.y = boxBbox.y + boxBbox.height * 0.5f;
+
+// 	return true;
+// }
+
+bool CubeDetectorNode::detectCircularHandle(const cv::Mat &frame, const cv::Rect &boxRegion, cv::Point2f &circleCenter, float &radius)
+{
+	// Search region: above the box
+	cv::Rect searchRegion = boxRegion;
+	searchRegion.y = std::max(0, boxRegion.y - boxRegion.height);
+	searchRegion.height = boxRegion.height * 2;
+	searchRegion.width = boxRegion.width;
+
+	if (searchRegion.area() <= 0) return false;
+
+	cv::Mat croppedFrame = frame(searchRegion);
+	cv::Mat hsv;
+	cv::cvtColor(croppedFrame, hsv, cv::COLOR_BGR2HSV);
+
+	// Create mask for dark/brown handle
+	cv::Mat mask;
+	cv::inRange(hsv,
+		cv::Scalar(_param_circle_h_min, _param_circle_s_min, _param_circle_v_min),
+		cv::Scalar(_param_circle_h_max, _param_circle_s_max, _param_circle_v_max),
+		mask);
+
+	// Detect circles using Hough Circle Transform
+	std::vector<cv::Vec3f> circles;
+	cv::HoughCircles(mask,
+		circles,
+		cv::HOUGH_GRADIENT,
+		1,                                     // dp
+		mask.rows / 2,                         // minDist
+		100,                                   // param1
+		20,                                    // param2
+		static_cast<int>(_param_circle_min_radius),
+		static_cast<int>(_param_circle_max_radius));
+
+	if (circles.empty()) {
+		return false;
+	}
+
+	// Use best circle
+	cv::Vec3f bestCircle = circles[0];
+	circleCenter.x = bestCircle[0] + searchRegion.x;
+	circleCenter.y = bestCircle[1] + searchRegion.y;
+	radius = bestCircle[2];
+
+	return true;
+}
+
+bool CubeDetectorNode::validateVictimGeometry(const VictimModel &model)
+{
+	if (!model.hasCircle) return false;
+
+	// Circle should be above box top
+	float boxTop = model.boxBbox.y;
+
+	// Circle center Y should be above box top
+	if (model.circleCenter.y > boxTop) {
+		return false;  // Circle below box top
+	}
+
+	// Circle center X should align with box (within some tolerance)
+	float boxCenterX = model.boxBbox.x + model.boxBbox.width * 0.5f;
+	float xDistance = std::abs(model.circleCenter.x - boxCenterX);
+	if (xDistance > model.boxBbox.width * 0.4f) {
+		return false;  // Circle too far from box X center
+	}
+
+	return true;
+}
+
+void CubeDetectorNode::estimate_victim_pose(
+	const VictimModel &target,
+	int image_width,
+	int image_height,
+	double &x,
+	double &y,
+	double &z) const
+{
+	(void)image_width;
+	(void)image_height;
+
+	const double cx = _camera_matrix.at<double>(0, 2);
+	const double cy = _camera_matrix.at<double>(1, 2);
+	const double fx = _camera_matrix.at<double>(0, 0);
+	const double fy = _camera_matrix.at<double>(1, 1);
+
+	const double px = target.boxCenter.x;
+	const double py = target.boxCenter.y;
+
+	const double pixel_width = static_cast<double>(target.boxBbox.width);
+
+	if (pixel_width < 1.0) {
+		x = 0.0;
+		y = 0.0;
+		z = 0.0;
+		return;
+	}
+
+	const double z_est = (fx * _param_box_width_m) / pixel_width;
+
+	x = (px - cx) * z_est / fx;
+	y = (py - cy) * z_est / fy;
+	z = z_est;
+}
+
+void CubeDetectorNode::updateKalmanFilter(double measured_x, double measured_y, double measured_z)
+{
+	// 1D Kalman filter for each axis independently
+	// Predict step
+	double pred_cov_x = _cov_x + _param_kalman_q;
+	double pred_cov_y = _cov_y + _param_kalman_q;
+	double pred_cov_z = _cov_z + _param_kalman_q;
+
+	// Update step
+	double K_x = pred_cov_x / (pred_cov_x + _param_kalman_r);
+	double K_y = pred_cov_y / (pred_cov_y + _param_kalman_r);
+	double K_z = pred_cov_z / (pred_cov_z + _param_kalman_r);
+
+	// Filter state update
+	_filtered_x += K_x * (measured_x - _filtered_x);
+	_filtered_y += K_y * (measured_y - _filtered_y);
+	_filtered_z += K_z * (measured_z - _filtered_z);
+
+	// Covariance update
+	_cov_x = (1.0 - K_x) * pred_cov_x;
+	_cov_y = (1.0 - K_y) * pred_cov_y;
+	_cov_z = (1.0 - K_z) * pred_cov_z;
+}
+
+void CubeDetectorNode::reset_lock_state()
+{
+	_locked = false;
+	_lock_center = cv::Point2f(0.0f, 0.0f);
+	_lock_visible_size = 0.0f;
+	_lock_missed = 0;
+
+	_has_last_seen_pose = false;
+	_last_seen_x = 0.0;
+	_last_seen_y = 0.0;
+	_last_seen_z = 0.0;
+
+	_last_seen_timer_started = false;
+	_last_seen_lost_start_time = rclcpp::Time(0, 0, RCL_ROS_TIME);
+}
+
+void CubeDetectorNode::annotate_image(
+	cv_bridge::CvImagePtr image,
+	const VictimModel &target,
+	double x,
+	double y,
+	double z) const
+{
+	// Draw box
+	if (target.boxBbox.area() > 0) {
+		cv::rectangle(image->image, target.boxBbox, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+		cv::circle(image->image, cv::Point(target.boxCenter), 5, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
+	}
+
+	// Background panel for text
+	cv::rectangle(
+		image->image,
+		cv::Point(8, 8),
+		cv::Point(280, 180),
+		cv::Scalar(40, 40, 40),
+		-1);
+
+	// Status
+	std::ostringstream status;
+	status << "Box: " << (target.valid ? "LOCKED" : "SEARCHING");
+	cv::putText(
+		image->image,
+		status.str(),
+		cv::Point(15, 30),
+		cv::FONT_HERSHEY_SIMPLEX,
+		0.8,
+		cv::Scalar(0, 255, 255),
+		2,
+		cv::LINE_AA);
+
+	if (_has_last_pose) {
+		std::ostringstream pose_x;
+		pose_x << std::fixed << std::setprecision(3) << "X: " << x << " m";
+		cv::putText(
+			image->image,
+			pose_x.str(),
+			cv::Point(15, 65),
+			cv::FONT_HERSHEY_SIMPLEX,
+			0.65,
+			cv::Scalar(255, 255, 0),
+			2,
+			cv::LINE_AA);
+
+		std::ostringstream pose_y;
+		pose_y << std::fixed << std::setprecision(3) << "Y: " << y << " m";
+		cv::putText(
+			image->image,
+			pose_y.str(),
+			cv::Point(15, 100),
+			cv::FONT_HERSHEY_SIMPLEX,
+			0.65,
+			cv::Scalar(255, 255, 0),
+			2,
+			cv::LINE_AA);
+
+		std::ostringstream pose_z;
+		pose_z << std::fixed << std::setprecision(3) << "Z: " << z << " m";
+		cv::putText(
+			image->image,
+			pose_z.str(),
+			cv::Point(15, 135),
+			cv::FONT_HERSHEY_SIMPLEX,
+			0.65,
+			cv::Scalar(255, 255, 0),
+			2,
+			cv::LINE_AA);
+	} else {
+		cv::putText(
+			image->image,
+			"X: N/A",
+			cv::Point(15, 65),
+			cv::FONT_HERSHEY_SIMPLEX,
+			0.65,
+			cv::Scalar(180, 180, 180),
+			2,
+			cv::LINE_AA);
+
+		cv::putText(
+			image->image,
+			"Y: N/A",
+			cv::Point(15, 100),
+			cv::FONT_HERSHEY_SIMPLEX,
+			0.65,
+			cv::Scalar(180, 180, 180),
+			2,
+			cv::LINE_AA);
+
+		cv::putText(
+			image->image,
+			"Z: N/A",
+			cv::Point(15, 135),
+			cv::FONT_HERSHEY_SIMPLEX,
+			0.65,
+			cv::Scalar(180, 180, 180),
+			2,
+			cv::LINE_AA);
+	}
+
+	std::ostringstream conf;
+	conf << "Conf: " << std::fixed << std::setprecision(2) << target.confidence;
+	cv::putText(
+		image->image,
+		conf.str(),
+		cv::Point(15, 170),
+		cv::FONT_HERSHEY_SIMPLEX,
+		0.65,
+		cv::Scalar(0, 255, 255),
+		2,
+		cv::LINE_AA);
+}
+
+int main(int argc, char *argv[])
+{
+	rclcpp::init(argc, argv);
+	rclcpp::spin(std::make_shared<CubeDetectorNode>());
+	rclcpp::shutdown();
+	return 0;
+}

@@ -1,0 +1,38 @@
+cube_detector_node:
+  ros__parameters:
+    # Box (victim cube) color detection - HSV Orange range
+    h_min:   5      # Hue min (0-180)
+    h_max:   30     # Hue max (orange range)
+    s_min:   80     # Saturation min (0-255)
+    s_max:   255    # Saturation max
+    v_min:   50     # Value min (0-255)
+    v_max:   255    # Value max
+
+    # Box area constraints
+    min_box_area:   500       # Minimum bounding box area (pixels²)
+    max_box_area:   200000    # Maximum bounding box area (pixels²)
+
+    # Circle (handle) color detection - Dark/Brown
+    circle_h_min:   0       # Hue min (any hue acceptable)
+    circle_h_max:   180     # Hue max
+    circle_s_min:   0       # Saturation min
+    circle_s_max:   50      # Saturation max (low saturation = dark colors)
+    circle_v_min:   0       # Value min
+    circle_v_max:   200     # Value max
+
+    # Circle geometry constraints
+    circle_min_radius:             15.0   # Minimum radius (pixels)
+    circle_max_radius:             80.0   # Maximum radius (pixels)
+    circle_position_tolerance:     0.15   # Circle Y within 15% above box top
+
+    # Victim model size
+    victim_size_m:  0.45    # Actual size of victim cube (meters)
+
+    # Tracking parameters
+    max_lock_missed:  30     # Max frames before losing lock
+
+    # Kalman filter parameters for smoothing XYZ coordinates
+    kalman_q:  0.01        # Process noise (lower = more trust in prediction)
+    kalman_r:  0.5         # Measurement noise (lower = more trust in measurement)
+                           # Tune: For flickering, increase q (less smoothing)
+                           # For slow response, decrease q (more smoothing)
